@@ -6,3 +6,4 @@ build*/
 .vs/
 Thumbs.db
 .DS_Store
+apps-ninfer-serve.bak-*
