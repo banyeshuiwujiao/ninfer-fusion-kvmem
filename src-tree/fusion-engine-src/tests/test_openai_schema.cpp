@@ -10,6 +10,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -658,9 +659,27 @@ int test_messages_and_media() {
                           media.messages[0].content[1].kind == ContentKind::Video,
                       "image and video compatibility inputs normalize to Engine media");
 
-    body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
-    failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
-                      "explicit image preprocessing detail rejected");
+    for (const Json detail : {Json("auto"), Json("low"), Json("high"), Json("original"), Json(nullptr)}) {
+        body["messages"][0]["content"][0]["image_url"]["detail"] = detail;
+        const GenerationRequest lowered = parse(body).generation;
+        failures += check(lowered.media_item_count() == 2 &&
+                              lowered.messages[0].content[0].source.kind ==
+                                  media.messages[0].content[0].source.kind &&
+                              lowered.messages[0].content[0].source.value ==
+                                  media.messages[0].content[0].source.value,
+                          "recognized image detail falls back to the same auto media input");
+    }
+    body["messages"][0]["content"][0]["image_url"].erase("detail");
+    failures += check(parse(body).generation.media_item_count() == 2,
+                      "omitted image detail retains auto behavior");
+    for (const Json detail : {Json("medium"), Json("HIGH"), Json(""), Json(64), Json(true),
+                              Json::object(), Json::array()}) {
+        body["messages"][0]["content"][0]["image_url"]["detail"] = detail;
+        const ApiError error = api_error([&] { (void)parse(body); });
+        failures += check(error.status == 400 && error.param == "messages" &&
+                              (!detail.is_string() || error.code == "invalid_value"),
+                          "unknown or malformed image detail remains an HTTP 400 error");
+    }
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();
@@ -688,7 +707,7 @@ int test_messages_and_media() {
                Json::array({Json{{"type", "text"}, {"text", "captured"}},
                             Json{{"type", "image_url"},
                                  {"image_url", Json{{"url", "https://example.test/capture.png"},
-                                                    {"detail", "auto"}}}}})}}});
+                                                    {"detail", "original"}}}}})}}});
     const GenerationRequest tool_image = parse(body).generation;
     failures += check(tool_image.messages.back().role == ninfer::ChatRole::Tool &&
                           tool_image.messages.back().tool_call_id == "call_capture" &&
@@ -1248,7 +1267,12 @@ int test_assistant_continuation_mode() {
     return failures;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--image-detail-only") {
+        const int failures = test_messages_and_media();
+        if (failures == 0) { std::cout << "OpenAI Chat image detail tests passed\n"; }
+        return failures == 0 ? 0 : 1;
+    }
     int failures = 0;
     failures += test_request_envelope_and_sampling();
     failures += test_structured_output();

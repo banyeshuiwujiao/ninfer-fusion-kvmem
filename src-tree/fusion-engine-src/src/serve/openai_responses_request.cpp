@@ -134,15 +134,7 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
         part.at("image_url").get_ref<const std::string&>().empty()) {
         bad_request("input_image must contain a non-empty image_url", "input");
     }
-    if (part.contains("detail") && !part.at("detail").is_null()) {
-        if (!part.at("detail").is_string()) {
-            bad_request("input_image.detail must be a string", "input");
-        }
-        if (part.at("detail").get<std::string>() != "auto") {
-            bad_request("only input_image detail 'auto' is supported", "input",
-                        "image_detail_not_supported");
-        }
-    }
+    validate_openai_image_detail(part, "input_image.detail", "input");
 
     ninfer::product::media_acquire::Source source;
     source.value = part.at("image_url").get<std::string>();

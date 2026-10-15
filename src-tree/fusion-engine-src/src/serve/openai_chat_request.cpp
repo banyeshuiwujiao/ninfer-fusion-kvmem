@@ -277,19 +277,7 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
             bad_request(std::string(field) + " must contain a string url", "messages");
         }
         url = value.at("url").get<std::string>();
-        if (image && value.contains("detail") && !value.at("detail").is_null()) {
-            if (!value.at("detail").is_string()) {
-                bad_request("image_url.detail must be a string", "messages");
-            }
-            const std::string detail = value.at("detail").get<std::string>();
-            if (detail != "auto") {
-                bad_request(
-                    "image_url.detail='" + detail +
-                        "' requests an explicit preprocessing profile that NInfer's fixed Vision "
-                        "frontend cannot apply; use 'auto'",
-                    "messages", "image_detail_not_supported");
-            }
-        }
+        if (image) { validate_openai_image_detail(value, "image_url.detail", "messages"); }
     } else {
         bad_request(std::string(field) + " must be a URL string or object", "messages");
     }

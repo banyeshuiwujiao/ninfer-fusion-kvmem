@@ -12,6 +12,7 @@
 #include <functional>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,9 +20,6 @@ namespace {
 
 using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
-
-constexpr char kReasoningSummaryPlaceholder[] =
-    "Reasoning summary is not supported. (Ninfer: OpenAI Responses API)";
 
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
@@ -271,6 +269,43 @@ int test_reasoning_encrypted_content_request() {
     return failures;
 }
 
+int test_image_detail_fallback() {
+    int failures = 0;
+    for (const char* role : {"user", "assistant"}) {
+        const Json image = {{"type", "input_image"},
+                            {"image_url", "data:image/png;base64,AA=="},
+                            {"detail", "auto"},
+                            {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}};
+        const Json message = {{"id", "msg_image"}, {"type", "message"}, {"role", role},
+                              {"content", Json::array({image})}};
+        Json body = {{"model", "m"}, {"input", Json::array({message})}};
+        const auto baseline = parse_openai_responses_create_request(body, limits());
+        for (const Json detail : {Json("auto"), Json("low"), Json("high"), Json("original"), Json(nullptr)}) {
+            body["input"][0]["content"][0]["detail"] = detail;
+            const auto request = parse_openai_responses_create_request(body, limits());
+            const auto& part = request.prompt.input_turns[0].content[0];
+            failures += check(request.prompt.input_items == baseline.prompt.input_items &&
+                                  part.kind == ContentKind::Image &&
+                                  part.source.value == "data:image/png;base64,AA==" &&
+                                  part.cache_boundary_after.has_value(),
+                              "image detail canonicalizes to auto without changing media or cache markers");
+        }
+        body["input"][0]["content"][0].erase("detail");
+        failures += check(parse_openai_responses_create_request(body, limits()).prompt.input_items ==
+                              baseline.prompt.input_items,
+                          "omitted image detail canonicalizes to auto");
+        for (const Json detail : {Json("medium"), Json("HIGH"), Json(""), Json(64), Json(true),
+                                  Json::object(), Json::array()}) {
+            body["input"][0]["content"][0]["detail"] = detail;
+            const auto error = api_error([&] { (void)parse_openai_responses_create_request(body, limits()); });
+            failures += check(error.status == 400 && error.param == "input" &&
+                                  (!detail.is_string() || error.code == "invalid_value"),
+                              "unknown or malformed image detail remains an HTTP 400 error");
+        }
+    }
+    return failures;
+}
+
 int test_typed_items_and_cache_markers() {
     const Json body = {
         {"model", "m"},
@@ -295,7 +330,7 @@ int test_typed_items_and_cache_markers() {
                                       {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}},
                                  Json{{"type", "input_image"},
                                       {"image_url", "data:image/png;base64,AA=="},
-                                      {"detail", "auto"}}})}},
+                                      {"detail", "original"}}})}},
               Json{{"id", "msg_refusal"},
                    {"type", "message"},
                    {"role", "assistant"},
@@ -1073,10 +1108,7 @@ int test_response_object() {
         make_openai_response_object("resp_test", 123, request, runtime, sample_outcome());
     const Json& response = built.body;
     int failures         = 0;
-    // RequestJson keeps insertion order and compares objects in it; the response is built with
-    // sorted keys, so the expected parts are written in that order.
-    const Json summary =
-        Json::array({Json{{"text", kReasoningSummaryPlaceholder}, {"type", "summary_text"}}});
+    const Json summary = Json::array();
     failures += check(response.at("object") == "response" && response.at("status") == "completed" &&
                           response.at("completed_at").is_number_integer(),
                       "completed response has a completion timestamp");
@@ -1085,7 +1117,7 @@ int test_response_object() {
                   response.at("output")[0].at("summary") == summary &&
                   response.at("output")[0].at("content")[0].at("text") == "thought" &&
                   response.at("output")[0].at("encrypted_content") == "thought",
-              "reasoning placeholders preserve raw reasoning in both replays");
+              "empty summaries preserve complete reasoning in both replay fields");
     failures += check(response.at("max_output_tokens").is_null(),
                       "omitted output budget remains null in the response");
     failures += check(response.at("output").size() == 2 &&
@@ -1098,7 +1130,7 @@ int test_response_object() {
             response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
             response.at("usage").at("total_tokens") == 18 && built.output_history.size() == 1 &&
             built.output_history[0].reasoning_content == "thought",
-        "summary placeholder does not enter usage or persisted reasoning history");
+        "summary hints do not change usage or persisted reasoning history");
 
     const OpenAIResponsesCreateRequest omitted_request = parse_openai_responses_create_request(
         Json{{"model", "m"}, {"input", "hello"}, {"store", false}}, limits());
@@ -1170,11 +1202,10 @@ int test_sse_sequence_and_failures() {
     int failures                    = 0;
     std::uint64_t expected_sequence = 0;
     std::string text_deltas;
-    std::string summary_deltas;
+    std::string reasoning_deltas;
     std::string reasoning_id;
     std::vector<std::string> event_types;
-    const Json summary =
-        Json::array({Json{{"text", kReasoningSummaryPlaceholder}, {"type", "summary_text"}}});
+    const Json summary = Json::array();
     for (const std::string& event : wire) {
         failures += check(event.find("[DONE]") == std::string::npos,
                           "Responses stream does not use Chat [DONE]");
@@ -1194,26 +1225,16 @@ int test_sse_sequence_and_failures() {
             failures += check(payload.at("output_index") == 0 &&
                                   payload.at("item").at("id") == reasoning_id &&
                                   payload.at("item").at("summary") == summary &&
+                                  payload.at("item").at("content")[0].at("text") == "thought" &&
                                   payload.at("item").at("encrypted_content") == "thought",
-                              "reasoning output_item.done carries the complete raw mirror");
+                              "reasoning output_item.done preserves raw text with an empty summary");
         } else if (type.starts_with("response.reasoning_summary_")) {
-            failures +=
-                check(payload.at("item_id") == reasoning_id && payload.at("output_index") == 0 &&
-                          payload.at("summary_index") == 0,
-                      "reasoning summary events retain stable Item indices");
-            if (type == "response.reasoning_summary_part.added") {
-                failures +=
-                    check(payload.at("part") == Json{{"text", ""}, {"type", "summary_text"}},
-                          "reasoning summary part starts empty");
-            } else if (type == "response.reasoning_summary_text.delta") {
-                summary_deltas += payload.at("delta").get<std::string>();
-            } else if (type == "response.reasoning_summary_text.done") {
-                failures += check(payload.at("text") == kReasoningSummaryPlaceholder,
-                                  "reasoning summary text done carries the placeholder");
-            } else if (type == "response.reasoning_summary_part.done") {
-                failures += check(payload.at("part") == summary.at(0),
-                                  "reasoning summary part done carries the placeholder");
-            }
+            failures += check(false, "unsupported summaries must not emit summary events");
+        } else if (type == "response.reasoning_text.delta") {
+            reasoning_deltas += payload.at("delta").get<std::string>();
+        } else if (type == "response.reasoning_text.done") {
+            failures += check(payload.at("text") == "thought",
+                              "completed reasoning text matches the streamed raw content");
         }
         if (type == "response.output_text.delta") {
             text_deltas += payload.at("delta").get<std::string>();
@@ -1222,10 +1243,6 @@ int test_sse_sequence_and_failures() {
     const std::vector<std::string> expected_types = {"response.created",
                                                      "response.in_progress",
                                                      "response.output_item.added",
-                                                     "response.reasoning_summary_part.added",
-                                                     "response.reasoning_summary_text.delta",
-                                                     "response.reasoning_summary_text.done",
-                                                     "response.reasoning_summary_part.done",
                                                      "response.content_part.added",
                                                      "response.reasoning_text.delta",
                                                      "response.reasoning_text.done",
@@ -1240,13 +1257,14 @@ int test_sse_sequence_and_failures() {
                                                      "response.output_item.done",
                                                      "response.completed"};
     failures +=
-        check(event_types == expected_types && summary_deltas == kReasoningSummaryPlaceholder,
-              "SSE emits the complete reasoning summary lifecycle in order");
+        check(event_types == expected_types && reasoning_deltas == "thought",
+              "SSE emits complete raw reasoning without placeholder summary events");
     failures += check(
         parse_event(wire.front()).at("type") == "response.created" &&
             parse_event(wire.back()).at("type") == "response.completed" &&
             parse_event(wire.back()).at("response").at("reasoning").at("summary") == "detailed" &&
             parse_event(wire.back()).at("response").at("output")[0].at("summary") == summary &&
+            parse_event(wire.back()).at("response").at("output")[0].at("content")[0].at("text") == "thought" &&
             parse_event(wire.back())
                     .at("response")
                     .at("output")[0]
@@ -1338,11 +1356,25 @@ int test_input_tokens_uses_shared_state_path() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--reasoning-only") {
+        const int failures = test_reasoning_encrypted_content_request() + test_response_object() +
+                             test_sse_sequence_and_failures() +
+                             test_response_output_history_round_trip();
+        if (failures == 0) { std::cout << "OpenAI Responses reasoning tests passed\n"; }
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--image-detail-only") {
+        const int failures = test_image_detail_fallback() + test_typed_items_and_cache_markers() +
+                             test_response_output_history_round_trip();
+        if (failures == 0) { std::cout << "OpenAI Responses image detail tests passed\n"; }
+        return failures == 0 ? 0 : 1;
+    }
     int failures = 0;
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_reasoning_encrypted_content_request();
+    failures += test_image_detail_fallback();
     failures += test_typed_items_and_cache_markers();
     failures += test_contiguous_assistant_items();
     failures += test_response_output_history_round_trip();
