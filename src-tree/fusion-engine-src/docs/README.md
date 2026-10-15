@@ -71,3 +71,7 @@ Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
 fields, parameter expansion and native supported domains are maintained by the code linked from
 these references.
+
+## Operations lessons
+
+- [重启竞态：引擎重启撞上 VRAM 释放窗口](重启竞态-引擎重启VRAM释放窗口-20261015.md) — restart 撞释放窗口的崩溃循环：判别、等待约定与可选加固（2026-10-15）
