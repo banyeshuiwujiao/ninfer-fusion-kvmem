@@ -105,61 +105,6 @@ inline bool kvmem_score_env_flag(const char* name, bool fallback) noexcept {
     return std::strtol(v, nullptr, 10) != 0;
 }
 
-// ---- ActKV (arXiv:2609.31395) action-oriented LRFU keep score -----------------------------------
-//
-// 给 one-shot 排序加一条**跨轮保持**的时间信号（参考实现同语义移植，见
-// kvmem-llama.cpp multi-backend `kvmem_store.cpp::accumulate_lrfu`）：
-//
-//     KS_t(i) = λ·KS_{t-1}(i) + hit_t(i)·score_t(i)
-//
-// one-shot 排序每一轮都从零重排全历史 ⇒ 前几轮"对动作关键"的块，只要本轮 query 不再提它
-// 就会掉出窗口 —— 这正是多轮会话"记忆丢失"的机理。KS 让"历史轮里被需要过"成为可累积的
-// 分数：命中过的块随轮衰减但不归零，冷块仍可回升。
-//
-//   * hit_t：**正分**且落在本轮 top-`TOP_FRAC`（默认 0.90，论文 p）之内。只取正分是承重的：
-//     打分器每轮对全部驻留块重打分，若对全量取阈值，即使 query 什么都没匹配上也会有 ~p 的
-//     块被记为"命中" ⇒ KS 随页龄增长 ⇒ 排序偏爱最老的块（而那正是 tier 早已丢掉 host 记录
-//     的块）。参考实现的注释原文同此（"KS would then grow with page AGE"）。
-//   * 非负钳制：本引擎分数是 softmax 质量（≥0），负值不会出现；钳制保留为不变量
-//     （对齐参考实现对 cosine 打分器的防御）。
-//   * 轮次幂等：一次"真打分的 chunk 收尾"算一轮；同一前沿的重复 finish 只重发排序、不二次衰减
-//     （对齐参考实现的轮次戳修复；本引擎 decode 不打分，重复主要来自防御性兜底）。
-//   * 选择门控（参考实现 A9）：排序用**临时 KS**（λ·KS + hit·score，全体命中块），
-//     但提交时**只有本轮真正 kept 的块**才把证据计入 —— 一个块必须赢得槽位，它的证据才算数；
-//     否则刚写入的块每轮都付衰减却永远赢不了槽位 ⇒ 针页刚写就被驱逐。
-//   * 发布：开关打开时，SELECT 日志之后 `score_host` 被覆盖为临时 KS —— ring 的二次排序
-//     （select_retrieval_pages 取 kept 集的 top budget）与 SCORE_DUMP 看到的就是选择所用的同一份
-//     时间信号。one-shot 原值仍是本轮 KS 的计算输入，SELECT 行的 sum_score/oracle 口径不变。
-//
-// 开关（house rule：env 只读一次、默认关、OFF 臂逐位不变）：
-//   NINFER_TERNARY_KVMEM_SCORE_LRFU=1            开（默认关）
-//   NINFER_TERNARY_KVMEM_SCORE_LRFU_LAMBDA=F     λ，0 < F < 1（默认 0.50）
-//   NINFER_TERNARY_KVMEM_SCORE_LRFU_TOP_FRAC=F   每轮命中比例，0 < F <= 1（默认 0.90）
-inline bool kvmem_score_lrfu_enabled() noexcept {
-    static const bool on = kvmem_score_env_flag("NINFER_TERNARY_KVMEM_SCORE_LRFU", false);
-    return on;
-}
-
-inline float kvmem_score_lrfu_lambda() noexcept {
-    static const float v = [] {
-        const char* s = std::getenv("NINFER_TERNARY_KVMEM_SCORE_LRFU_LAMBDA");
-        if (s == nullptr || s[0] == '\0') { return 0.50F; }
-        const float f = std::strtof(s, nullptr);
-        return (f > 0.0F && f < 1.0F) ? f : 0.50F;
-    }();
-    return v;
-}
-
-inline float kvmem_score_lrfu_top_frac() noexcept {
-    static const float v = [] {
-        const char* s = std::getenv("NINFER_TERNARY_KVMEM_SCORE_LRFU_TOP_FRAC");
-        if (s == nullptr || s[0] == '\0') { return 0.90F; }
-        const float f = std::strtof(s, nullptr);
-        return (f > 0.0F && f <= 1.0F) ? f : 0.90F;
-    }();
-    return v;
-}
-
 // ---- 探针状态（进程级单例，与 mean-K 索引同寿命）---------------------------------------------
 struct KvMemScoreProbe {
     // device 缓冲
@@ -205,14 +150,6 @@ struct KvMemScoreProbe {
     bool failed   = false;                 // 出过致命几何/分配错 ⇒ 之后一律不打分（但引擎继续跑）
     bool logged_once = false;
     bool logged_span_segment = false;   // B05: 长 span 改为切段打分，只喊一次（它是"行为变了"的证据行）
-    // ---- ActKV 时间保持分状态（进程级单例，与 mean-K 索引同寿命；单 lane 纪律同探针）----------
-    // 以**绝对块号**为下标（本引擎唯一调用点 first_block 恒为 0）；随历史增长、永不收缩。
-    // 跨 chunk/请求持久是刻意的：KS 承载的正是 one-shot 排序缺失的"此前轮次被需要过"信号。
-    std::vector<double> lrfu_ks;          // 已提交 keep 分（默认 0）
-    std::vector<float>  lrfu_rank;        // 本轮临时 KS（= 排序信号；开关关时不使用）
-    std::vector<double> lrfu_scratch;     // 命中掩码 scratch（成员复用，不逐轮分配）
-    std::uint64_t       lrfu_last_round = 0;
-    bool                lrfu_round_seen = false;
 };
 
 inline KvMemScoreProbe& kvmem_score_probe() {
@@ -561,94 +498,16 @@ inline void kvmem_score_finish(const char* label, std::int32_t query_tokens,
     double sum_score = 0.0;
     for (std::int32_t i = 0; i < p.n_blocks; ++i) { sum_score += static_cast<double>(p.score_host[i]); }
 
-    // ---- ActKV 时间保持分：折叠本轮证据 → 按临时 KS 排序 → 选择门控提交 ------------------------
-    // 关（默认）时整个分支不可达，select 吃到的仍是 score_host 原指针（OFF 臂逐位不变）。
-    std::vector<float>* ranking_scores = &p.score_host;
-    float lrfu_lambda_log = 0.0F, lrfu_top_frac_log = 0.0F;
-    bool lrfu_repeated_round = false;
-    if (kvmem_score_lrfu_enabled()) {
-        const float lambda   = kvmem_score_lrfu_lambda();
-        const float top_frac = kvmem_score_lrfu_top_frac();
-        lrfu_lambda_log      = lambda;
-        lrfu_top_frac_log    = top_frac;
-        const std::int32_t n = p.n_blocks;
-        if (p.lrfu_ks.size() < static_cast<std::size_t>(n)) {
-            p.lrfu_ks.resize(static_cast<std::size_t>(n), 0.0);   // 新尾块从 0 起步
-        }
-        // 轮次：绝对 chunk 末端 = 前沿 stand-in（参考实现 round_id==0 的同款语义）；未知则用块数
-        // （随历史单调，同样满足"同前沿 = 同轮"）。同轮重复只重发排序，不二次衰减。
-        const std::uint64_t round = p.abs_chunk_begin >= 0
-            ? static_cast<std::uint64_t>(p.abs_chunk_begin) + static_cast<std::uint64_t>(p.chunk_tokens)
-            : static_cast<std::uint64_t>(n);
-        const bool repeated_round = p.lrfu_round_seen && p.lrfu_last_round == round;
-        p.lrfu_last_round = round;
-        p.lrfu_round_seen = true;
-        lrfu_repeated_round = repeated_round;
-
-        // 命中掩码：正分里取 top-`top_frac` 分位（nth_element，成员 scratch 复用，不逐轮分配）。
-        p.lrfu_scratch.clear();
-        for (std::int32_t i = 0; i < n; ++i) {
-            const float s = p.score_host[i];
-            if (s > 0.0F) { p.lrfu_scratch.push_back(static_cast<double>(s)); }
-        }
-        const std::size_t n_pos = p.lrfu_scratch.size();
-        const bool thresholded  = top_frac < 1.0F && n_pos > 1;
-        double threshold = 0.0;
-        if (n_pos > 0) {
-            std::size_t rank = static_cast<std::size_t>(
-                (1.0 - static_cast<double>(top_frac)) * static_cast<double>(n_pos));
-            if (rank >= n_pos) { rank = n_pos - 1; }
-            std::nth_element(p.lrfu_scratch.begin(),
-                             p.lrfu_scratch.begin() + static_cast<std::ptrdiff_t>(rank),
-                             p.lrfu_scratch.end());
-            threshold = thresholded ? p.lrfu_scratch[rank] : 0.0;
-        }
-
-        // 临时 KS（排序信号）：λ·KS + 本轮命中证据（**不**管选择）——否则首轮全零会静默回落
-        // recency、之后老块把窗口锁死，刚写的针页永远赢不了槽位（参考实现 A9 的教训）。
-        p.lrfu_rank.assign(static_cast<std::size_t>(n), 0.0F);
-        for (std::int32_t i = 0; i < n; ++i) {
-            const std::size_t idx = static_cast<std::size_t>(i);
-            const float s = p.score_host[idx];
-            const bool hit = s > 0.0F && (!thresholded || static_cast<double>(s) >= threshold);
-            double ks = lambda * p.lrfu_ks[idx];
-            if (!repeated_round && hit) { ks += static_cast<double>(s); }
-            if (ks < 0.0) { ks = 0.0; }
-            p.lrfu_rank[idx] = static_cast<float>(ks);
-        }
-        ranking_scores = &p.lrfu_rank;
-    }
-
     KvMemSelectConfig scfg;
     scfg.total_blocks  = p.n_blocks;
     scfg.budget_blocks = budget_tokens / p.block_tokens;
     scfg.sink_blocks   = sink_tokens / p.block_tokens;
     scfg.recent_blocks = recent_tokens / p.block_tokens;
-    const KvMemSelectResult sel = ops::kvmem_select_blocks(scfg, ranking_scores->data(), 0);
+    const KvMemSelectResult sel = ops::kvmem_select_blocks(scfg, p.score_host.data(), 0);
     // LOCAL (2026-10-02, the caller step): publish the selection for the ring. Written AFTER the
     // selector returns and only when this chunk really scored, so a failed/skipped round leaves the
     // previous selection intact instead of emptying it.
     p.kept = sel.kept;
-
-    // ---- ActKV 选择门控提交 + 发布 --------------------------------------------------------------
-    // 只有本轮真正 kept 的块把证据计入 committed KS；未 kept 的块只衰减（A9：一个块必须赢得
-    // 槽位，它的证据才算数）。然后把 score_host 覆盖为临时 KS —— ring 的二次排序
-    // （select_retrieval_pages 取 kept 集的 top budget）与 SCORE_DUMP 改读 KS，选择与下游看到
-    // 同一份时间信号。one-shot 原值已完成使命（sum_score/oracle 在上面已经算完打出来）。
-    if (kvmem_score_lrfu_enabled() && !p.lrfu_rank.empty() && p.lrfu_ks.size() >= p.lrfu_rank.size()) {
-        const float lambda = kvmem_score_lrfu_lambda();
-        const std::int32_t n = static_cast<std::int32_t>(p.lrfu_rank.size());
-        for (std::int32_t i = 0; i < n; ++i) {
-            const std::size_t idx = static_cast<std::size_t>(i);
-            const float s = p.score_host[idx];            // 仍是 one-shot（尚未覆盖）
-            const bool kept = std::binary_search(p.kept.begin(), p.kept.end(), i);
-            double ks = lambda * p.lrfu_ks[idx];
-            if (!lrfu_repeated_round && kept && s > 0.0F) { ks += static_cast<double>(s); }
-            if (ks < 0.0) { ks = 0.0; }
-            p.lrfu_ks[idx] = ks;
-        }
-        p.score_host = p.lrfu_rank;
-    }
 
     // 选择结构的形状（这是判据的核心：非连续 ⇒ 真在选择）
     std::int32_t runs = 0;
@@ -685,15 +544,6 @@ inline void kvmem_score_finish(const char* label, std::int32_t query_tokens,
                  (q_used > 0 && sum_score > 0.5 * q_used && sum_score < 2.0 * q_used) ? 1 : 0,
                  static_cast<double>(ops::kvmem_retrieve_scale(p.head_dim)), p.harvest_layers,
                  p.harvest_layers_total);
-    // ActKV 证据行（只在开关打开时出现；OFF 臂的日志流与旧二进制逐字节同格式）
-    if (kvmem_score_lrfu_enabled()) {
-        std::fprintf(stderr,
-                     "kvmem_score: LRFU lambda=%.2f top_frac=%.2f repeated=%d "
-                     "ranking=KS published=KS\n",
-                     static_cast<double>(lrfu_lambda_log),
-                     static_cast<double>(lrfu_top_frac_log),
-                     lrfu_repeated_round ? 1 : 0);
-    }
 }
 
 // 逐块分数导出（给离线判据用：核对"含针的块"有没有被选中）。只在 switch 打开且本 chunk 打过时写。
